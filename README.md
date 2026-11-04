@@ -28,7 +28,9 @@ loopback port 8421 is not an independently exposed public storage endpoint.
 The backend schema is maintained in [CBGPU-backend](https://github.com/CBGPU-Engineering/CBGPU-backend).
 [CBGPU-platform](https://github.com/CBGPU-Engineering/CBGPU-platform) assembles this repository at `MaterialShare/`.
 
-CI validates dependency installation and imports/syntax; live file transfer,
+CI starts a real loopback Uvicorn server with a synthetic upstream to verify
+readiness and unauthenticated file-access rejection. It also checks imports and
+syntax; live file transfer,
 RLS and quota integration checks require an isolated backend and test storage.
 See [CONTRIBUTING.md](CONTRIBUTING.md), [SECURITY.md](SECURITY.md) and
 [LICENSE](LICENSE). Historical deployment notes are retained in docs for provenance;
