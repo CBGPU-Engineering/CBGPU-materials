@@ -1,0 +1,12 @@
+
+# Local runtime state and credentials.
+.env
+.env.local
+*.jks
+*.keystore
+key.properties
+__pycache__/
+*.pyc
+.venv/
+/dist/
+/release-artifacts/
