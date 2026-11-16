@@ -1,67 +1,80 @@
 # CBGPU Materials
 
 [![CI](https://github.com/CBGPU-Engineering/CBGPU-materials/actions/workflows/ci.yml/badge.svg)](https://github.com/CBGPU-Engineering/CBGPU-materials/actions/workflows/ci.yml)
-[![FastAPI](https://img.shields.io/badge/FastAPI-File%20API-009688?logo=fastapi)](https://fastapi.tiangolo.com)
+[![Rust](https://img.shields.io/badge/Rust-Axum-000000?logo=rust)](https://www.rust-lang.org/)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-D22128)](LICENSE)
 
-The authenticated file-byte API for CBGPU shared materials. Searchable metadata
-and ownership live in Supabase; file bytes are stored locally under UUID paths.
-The service supports resumable uploads and quota accounting.
+The authenticated Rust file-transfer service for CBGPU shared materials. It stores
+file bytes on the server and uses the existing PostgreSQL metadata API for
+authentication, ownership and row access policies. The Rust service replaced the
+Python file server on November 16, 2026, using the same loopback port and storage.
 
-## Local environment
+- **Resumable uploads** — 8 MiB chunks with persistent offsets and quota reservations.
+- **Recovery** — interrupted chunks roll back; a lost completion acknowledgement can be retried without losing the completed file.
+- **Private downloads** — caller authentication and metadata access checks before streaming bytes, including HTTP range requests.
+- **Storage accounting** — concurrent reservations share one quota; stale upload cleanup preserves active uploads and completed files.
+
+## Getting started
+
+Requires Rust 1.88 or later. Create an isolated storage directory and load your
+private configuration using the variables in [.env.example](.env.example).
 
 ```bash
-git clone https://github.com/CBGPU-Engineering/CBGPU-materials.git
-cd CBGPU-materials
-python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt
-cp .env.example .env
+mkdir -p /tmp/cbgpu-materials-dev
+cargo run --locked
 ```
 
-Set your own isolated backend URL/public client key, origins and storage path.
-Load the environment before starting `uvicorn app:app --host 127.0.0.1 --port 8421`.
-For containers, use `docker build -t cbgpu-materials .` and a private `--env-file`.
-Never point a development fixture at production student files.
+The default listener is 127.0.0.1:8423. Writes default to disabled. For a new
+isolated development instance, set CBGPU_MATERIALS_WRITES_ENABLED=1 and
+CBGPU_MATERIALS_LEGACY_QUIESCED=1 after confirming no other writer uses that
+directory. Never run multiple writers against the same files. Public client keys
+and caller tokens preserve the existing metadata authorization boundary; the
+service does not need a service-role key.
 
-The production web application reaches this API through `/api/files`; internal
-loopback port 8421 is not an independently exposed public storage endpoint.
-The backend schema is maintained in [CBGPU-backend](https://github.com/CBGPU-Engineering/CBGPU-backend).
-[CBGPU-platform](https://github.com/CBGPU-Engineering/CBGPU-platform) assembles this repository at `MaterialShare/`.
-
-CI starts a real loopback Uvicorn server with a synthetic upstream to verify
-readiness and unauthenticated file-access rejection. It also checks imports and
-syntax; live file transfer,
-RLS and quota integration checks require an isolated backend and test storage.
-See [CONTRIBUTING.md](CONTRIBUTING.md), [SECURITY.md](SECURITY.md) and
-[LICENSE](LICENSE). Historical deployment notes are retained in docs for provenance;
-old Funnel addresses are not the current default API entry point.
-
-## Rust transfer implementation
-
-The Axum implementation is a migration candidate; the Python service remains
-the production writer until a drained handoff. Both versions use the same UUID
-file layout, metadata API, caller authentication and PostgreSQL row policies.
-No service-role key is needed.
-
-Run isolated checks with Rust 1.88 or later:
+## Container
 
 ```bash
+docker build -t cbgpu-materials-rust .
+```
+
+The image runs as UID 65532 by default and listens on container port 8421. Use
+a private environment file, mount the storage directory at /data, and publish
+only on loopback. For existing storage, run with its established non-root owner
+and verify file permissions. The readiness probe checks writable storage and
+metadata connectivity. The production website reaches this service through
+/api/files; the file server is not an unauthenticated public storage endpoint.
+
+## Verification
+
+```bash
+cargo fmt --check
 cargo test --locked
 cargo clippy --locked --all-targets -- -D warnings
-docker build -f Dockerfile.rust -t cbgpu-materials-rust .
+npm ci --ignore-scripts
+npm run check
+CBGPU_MATERIALS_TEST_IMAGE=cbgpu-materials-rust node scripts/test-rust-container.mts
 ```
 
-The default listener is 127.0.0.1:8423. Set CBGPU_MATERIALS_DIR to an existing
-isolated directory and use the same metadata URL and public key variables as
-the legacy service. Writes are disabled by default. A single Rust process
-locks its storage directory; this lock does not coordinate with Python.
-Before enabling CBGPU_MATERIALS_WRITES_ENABLED=1 and
-CBGPU_MATERIALS_LEGACY_QUIESCED=1, route away and drain every legacy upload.
-Do not run both writers against one directory. The container uses UID 65532;
-verify directory and existing file access before handoff without changing
-permissions during active uploads.
+Nine integration tests use temporary storage and a loopback metadata fixture,
+covering recovery, caller isolation, cancellation, quotas, cleanup and range
+downloads. The container test checks non-root execution with a read-only root
+filesystem, readiness, authentication rejection and disabled writes. It does not
+connect to production files or accounts.
 
-Tests use temporary files and a loopback metadata fixture. They cover chunk
-resume, ranges, account isolation, lost completion acknowledgements, rollback
-on request cancellation, persistent reservations, concurrent quota allocation
-and symlink rejection. They never connect to production accounts or files.
+## Project structure
+
+```text
+src/             Axum API, authentication transport and file storage
+tests/           Isolated Rust transfer and storage contracts
+scripts/         TypeScript publication, checksum and container checks
+Dockerfile       Rust build and minimal Debian runtime
+Cargo.lock       Reproducible Rust dependencies
+```
+
+The metadata schema is maintained in [CBGPU-backend](https://github.com/CBGPU-Engineering/CBGPU-backend).
+[CBGPU-platform](https://github.com/CBGPU-Engineering/CBGPU-platform) assembles this component at MaterialShare/.
+See [CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md).
+
+## License
+
+Licensed under [Apache 2.0](LICENSE). Third-party dependencies retain their own licenses.
