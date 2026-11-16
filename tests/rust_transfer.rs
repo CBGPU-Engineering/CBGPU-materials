@@ -289,3 +289,37 @@ async fn cancelled_request_truncates_uncommitted_chunk() {
     assert_eq!(f.storage.usage(false).unwrap().reserved_bytes, 6);
     assert_eq!(f.call("PUT", "/chunks", "owner", "abcdef").await.0, 200);
 }
+
+#[test]
+fn cleanup_skips_active_uploads_and_never_deletes_completed_files() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Storage::open(directory.path().into(), 100).unwrap();
+    let id = Uuid::new_v4();
+    let paths = storage.reserve(id, "owner", 6).unwrap();
+    std::fs::write(&paths.partial, b"abc").unwrap();
+    for path in [&paths.partial, &paths.reservation] {
+        std::fs::File::open(path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(std::time::SystemTime::UNIX_EPOCH))
+            .unwrap();
+    }
+    let lock = storage.lock(id);
+    let guard = lock.try_lock().unwrap();
+    assert_eq!(storage.usage(true).unwrap().reserved_bytes, 6);
+    assert!(paths.partial.exists());
+    drop(guard);
+    assert_eq!(storage.usage(true).unwrap().reserved_bytes, 0);
+    assert!(!paths.partial.exists());
+    assert!(!paths.reservation.exists());
+    let ready = Uuid::new_v4();
+    let paths = storage.reserve(ready, "owner", 6).unwrap();
+    std::fs::write(&paths.partial, b"abcdef").unwrap();
+    storage.promote(ready, 6).unwrap();
+    storage.acknowledge(ready).unwrap();
+    std::fs::File::open(&paths.complete)
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(std::time::SystemTime::UNIX_EPOCH))
+        .unwrap();
+    assert_eq!(storage.usage(true).unwrap().used_bytes, 6);
+    assert_eq!(std::fs::read(paths.complete).unwrap(), b"abcdef");
+}
