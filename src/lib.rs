@@ -200,7 +200,7 @@ impl App {
                     "Could not finish upload; retry the upload status request",
                 )
             })?;
-        if status != 200 || !value.as_array().is_some_and(|rows| !rows.is_empty()) {
+        if status != 200 || value.as_array().is_none_or(|rows| rows.is_empty()) {
             return Err(Failure(
                 503,
                 "Could not finish upload; retry the upload status request",
@@ -383,7 +383,7 @@ async fn handle(State(app): State<Arc<App>>, request: Request) -> Result<Respons
                 None,
             )
             .await?;
-        if status != 200 || !value.as_array().is_some_and(|rows| !rows.is_empty()) {
+        if status != 200 || value.as_array().is_none_or(|rows| rows.is_empty()) {
             return Err(Failure(503, "Could not delete material"));
         }
         app.storage.delete(id)?;
