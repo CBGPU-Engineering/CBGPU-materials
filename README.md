@@ -35,3 +35,33 @@ RLS and quota integration checks require an isolated backend and test storage.
 See [CONTRIBUTING.md](CONTRIBUTING.md), [SECURITY.md](SECURITY.md) and
 [LICENSE](LICENSE). Historical deployment notes are retained in docs for provenance;
 old Funnel addresses are not the current default API entry point.
+
+## Rust transfer implementation
+
+The Axum implementation is a migration candidate; the Python service remains
+the production writer until a drained handoff. Both versions use the same UUID
+file layout, metadata API, caller authentication and PostgreSQL row policies.
+No service-role key is needed.
+
+Run isolated checks with Rust 1.88 or later:
+
+```bash
+cargo test --locked
+cargo clippy --locked --all-targets -- -D warnings
+docker build -f Dockerfile.rust -t cbgpu-materials-rust .
+```
+
+The default listener is 127.0.0.1:8423. Set CBGPU_MATERIALS_DIR to an existing
+isolated directory and use the same metadata URL and public key variables as
+the legacy service. Writes are disabled by default. A single Rust process
+locks its storage directory; this lock does not coordinate with Python.
+Before enabling CBGPU_MATERIALS_WRITES_ENABLED=1 and
+CBGPU_MATERIALS_LEGACY_QUIESCED=1, route away and drain every legacy upload.
+Do not run both writers against one directory. The container uses UID 65532;
+verify directory and existing file access before handoff without changing
+permissions during active uploads.
+
+Tests use temporary files and a loopback metadata fixture. They cover chunk
+resume, ranges, account isolation, lost completion acknowledgements, rollback
+on request cancellation, persistent reservations, concurrent quota allocation
+and symlink rejection. They never connect to production accounts or files.

@@ -12,3 +12,5 @@ __pycache__/
 /release-artifacts/
 
 node_modules/
+
+/target/
