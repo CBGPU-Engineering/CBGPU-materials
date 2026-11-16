@@ -1,5 +1,5 @@
 import {execFileSync}from'node:child_process';import fs from'node:fs';
-const files=execFileSync('git',['ls-files','-z'],{encoding:'utf8'}).split('\0').filter(Boolean),problems=[];
+const files=execFileSync('git',['ls-files','-z'],{encoding:'utf8'}).split('\0').filter(Boolean),problems: string[]=[];
 for(const file of files){
  if(/(?:^|\/)(?:private|backups|node_modules|\.venv|\.dart_tool)(?:\/|$)|\.(?:jks|keystore|p12|apk|bundle)$|(?:^|\/)key\.properties$/.test(file))problems.push('Private/generated file tracked: '+file);
  if(/(?:^|\/)\.env(?:\.|$)/.test(file)&&!file.endsWith('.example'))problems.push('Environment file tracked: '+file);

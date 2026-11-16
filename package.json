@@ -1,0 +1,15 @@
+{
+  "name": "@cbgpu/materials-tooling",
+  "private": true,
+  "scripts": {
+    "check": "tsc --noEmit",
+    "check:publication": "node scripts/check-publication.mts"
+  },
+  "engines": {
+    "node": ">=22.18"
+  },
+  "devDependencies": {
+    "typescript": "5.9.3",
+    "@types/node": "22.20.5"
+  }
+}
