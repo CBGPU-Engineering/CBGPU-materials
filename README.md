@@ -268,3 +268,13 @@ This requires the reviewed account/school migrations (including scoped material
 RLS) and a paired web/file-service handoff. Existing operating immutable releases
 and `/api/files` origin are unchanged by source preparation. Tests use disposable
 storage and synthetic metadata, never operating user files.
+
+The runtime image includes Debian's CA certificate bundle for the S3 client's
+platform-root TLS verifier; metadata HTTP and TLS roots remain separate concerns.
+`tests/s3_tls.rs` is an ignored, disposable **HTTPS loopback MinIO** fixture.
+Provide `CBGPU_MATERIALS_TEST_S3_ENDPOINT` and
+`CBGPU_MATERIALS_TEST_S3_CA`; trust that fixture CA with `SSL_CERT_FILE` only in
+the fixture process. It checks upload, SHA-256, ranged reads and deletion over
+verified TLS. The separate `CBGPU_MATERIALS_TEST_S3_EXPECT_UNTRUSTED=1` run must
+reject that endpoint without the fixture CA. No certificate-verification bypass
+or real AWS endpoint is used.

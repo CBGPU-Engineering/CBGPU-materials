@@ -6,7 +6,9 @@ COPY src ./src
 RUN cargo build --release --locked --jobs 4
 
 FROM debian:bookworm-slim
-RUN mkdir -p /data && chown 65532:65532 /data
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /data && chown 65532:65532 /data
 COPY --from=build /build/target/release/cbgpu-materials /usr/local/bin/cbgpu-materials
 USER 65532:65532
 ENV CBGPU_MATERIALS_DIR=/data \
