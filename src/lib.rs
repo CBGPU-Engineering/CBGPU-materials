@@ -1,3 +1,4 @@
+pub mod objects;
 pub mod storage;
 use axum::{
     Router,
@@ -180,7 +181,7 @@ impl App {
         Ok(())
     }
     async fn finish(&self, token: &str, id: Uuid, owner: &str, size: u64) -> Result<()> {
-        self.storage.promote(id, size)?;
+        self.storage.promote_async(id, size).await?;
         let (status, value) = self
             .json(
                 reqwest::Method::PATCH,
@@ -290,6 +291,7 @@ async fn handle(State(app): State<Arc<App>>, request: Request) -> Result<Respons
     let method = request.method().as_str().to_owned();
     if path == "/health" && method == "GET" {
         app.storage.writable_probe()?;
+        app.storage.object_probe().await?;
         let (status, _) = app
             .json(
                 reqwest::Method::GET,
@@ -314,9 +316,7 @@ async fn handle(State(app): State<Arc<App>>, request: Request) -> Result<Respons
         }
         let storage = app.storage.clone();
         let clean = app.writes;
-        let usage = tokio::task::spawn_blocking(move || storage.usage(clean))
-            .await
-            .map_err(|_| Failure(503, "Materials storage is unavailable"))??;
+        let usage = storage.usage_async(clean).await?;
         return Ok(output(if admin {
             let mut value =
                 serde_json::to_value(usage).map_err(|_| Failure(503, "Cannot encode usage"))?;
@@ -343,7 +343,7 @@ async fn handle(State(app): State<Arc<App>>, request: Request) -> Result<Respons
         let material = app.material(&token, id).await?;
         let paths = app.storage.paths(id);
         if material["status"] != "ready"
-            || app.storage.size(&paths.complete)? != Some(size(&material)?)
+            || app.storage.completed_size(id).await? != Some(size(&material)?)
         {
             return Err(Failure(404, "File not found"));
         }
@@ -351,11 +351,17 @@ async fn handle(State(app): State<Arc<App>>, request: Request) -> Result<Respons
             .as_str()
             .ok_or(Failure(503, "Invalid download metadata"))?;
         let disposition = filename(name)?;
-        let response = tower_http::services::ServeFile::new(&paths.complete)
-            .oneshot(request)
-            .await
-            .map_err(|_| Failure(503, "File service is unavailable"))?;
-        let mut response = response.map(Body::new);
+        let mut response = if app.storage.remote() {
+            app.storage
+                .object_response(id, size(&material)?, request.headers(), method == "HEAD")
+                .await?
+        } else {
+            tower_http::services::ServeFile::new(&paths.complete)
+                .oneshot(request)
+                .await
+                .map_err(|_| Failure(503, "File service is unavailable"))?
+                .map(Body::new)
+        };
         response
             .headers_mut()
             .insert("content-disposition", disposition);
@@ -386,7 +392,7 @@ async fn handle(State(app): State<Arc<App>>, request: Request) -> Result<Respons
         if status != 200 || value.as_array().is_none_or(|rows| rows.is_empty()) {
             return Err(Failure(503, "Could not delete material"));
         }
-        app.storage.delete(id)?;
+        app.storage.delete_async(id).await?;
         return Ok(output(json!({"ok":true})));
     }
     if parts.len() != 3 {
@@ -394,7 +400,7 @@ async fn handle(State(app): State<Arc<App>>, request: Request) -> Result<Respons
     }
     if parts[2] == "upload" && method == "GET" {
         if material["status"] == "ready" {
-            if app.storage.size(&paths.complete)? != Some(expected) {
+            if app.storage.completed_size(id).await? != Some(expected) {
                 return Err(Failure(404, "File not found"));
             }
             app.storage.acknowledge(id)?;
@@ -405,7 +411,7 @@ async fn handle(State(app): State<Arc<App>>, request: Request) -> Result<Respons
         if material["status"] != "pending" {
             return Err(Failure(403, "Upload is not pending"));
         }
-        if app.storage.size(&paths.complete)?.is_some()
+        if app.storage.completed_size(id).await?.is_some()
             || app.storage.size(&paths.partial)? == Some(expected)
         {
             app.finish(&token, id, &owner, expected).await?;
@@ -449,12 +455,12 @@ async fn handle(State(app): State<Arc<App>>, request: Request) -> Result<Respons
         return Err(Failure(400, "Invalid upload offset"));
     }
     if whole
-        && (app.storage.size(&paths.complete)?.is_some()
+        && (app.storage.completed_size(id).await?.is_some()
             || app.storage.size(&paths.partial)?.is_some())
     {
         return Err(Failure(409, "File already exists or upload is in progress"));
     }
-    if !whole && app.storage.size(&paths.complete)?.is_some() {
+    if !whole && app.storage.completed_size(id).await?.is_some() {
         return Err(Failure(409, "File already exists; check upload status"));
     }
     if !whole && app.storage.size(&paths.partial)?.unwrap_or(0) != offset {
@@ -476,7 +482,7 @@ async fn handle(State(app): State<Arc<App>>, request: Request) -> Result<Respons
             ));
         }
     }
-    app.storage.reserve(id, &owner, expected)?;
+    app.storage.reserve_async(id, &owner, expected).await?;
     let _whole = whole.then(|| WholeWrite {
         storage: app.storage.clone(),
         id,

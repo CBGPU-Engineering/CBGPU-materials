@@ -30,9 +30,29 @@ async fn run() -> std::result::Result<(), &'static str> {
         .unwrap_or_else(|_| (100_u64 * 1024 * 1024 * 1024).to_string())
         .parse()
         .map_err(|_| "Invalid storage quota")?;
-    let storage = Storage::open(root, quota).map_err(
+    let mut storage = Storage::open(root, quota).map_err(
         |_| "Materials storage is not ready or is already owned by another Rust instance",
     )?;
+    match env::var("CBGPU_MATERIALS_STORAGE_BACKEND").as_deref() {
+        Err(_) | Ok("local") => {}
+        Ok("s3") => {
+            if env::var("CBGPU_MATERIALS_WRITES_ENABLED").as_deref() == Ok("1")
+                && env::var("CBGPU_MATERIALS_S3_SINGLE_WRITER").as_deref() != Ok("1")
+            {
+                return Err(
+                    "S3 writes require reviewed single-writer staging; multi-replica coordination is not enabled",
+                );
+            }
+            storage = storage.with_objects(
+                cbgpu_materials::objects::Objects::s3(
+                    cbgpu_materials::objects::S3Config::from_env()
+                        .map_err(|_| "Private S3 configuration required")?,
+                )
+                .map_err(|_| "Private S3 configuration invalid")?,
+            );
+        }
+        _ => return Err("Storage backend must be local or s3"),
+    }
     let writes = match env::var("CBGPU_MATERIALS_WRITES_ENABLED").as_deref() {
         Ok("1") => true,
         Ok("0") | Err(_) => false,
@@ -86,7 +106,8 @@ async fn run() -> std::result::Result<(), &'static str> {
         Some(tokio::spawn(async move {
             loop {
                 let storage = storage.clone();
-                let _ = tokio::task::spawn_blocking(move || storage.usage(true)).await;
+                let _ = storage.cleanup_object_deletions().await;
+                let _ = storage.usage_async(true).await;
                 tokio::time::sleep(Duration::from_secs(600)).await;
             }
         }))

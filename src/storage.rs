@@ -15,6 +15,8 @@ pub const MAX_CHUNK: u64 = 8 * 1024 * 1024;
 const PARTIAL_TTL: Duration = Duration::from_secs(86400);
 #[derive(Clone)]
 pub struct Storage {
+    objects: crate::objects::Objects,
+    reservation_gate: Arc<AsyncMutex<()>>,
     pub root: PathBuf,
     pub quota: u64,
     serial: Arc<Mutex<()>>,
@@ -95,6 +97,8 @@ impl Storage {
             )
         })?;
         Ok(Self {
+            objects: crate::objects::Objects::local(root.clone())?,
+            reservation_gate: Arc::new(AsyncMutex::new(())),
             root,
             quota,
             serial: Arc::new(Mutex::new(())),
@@ -270,6 +274,18 @@ impl Storage {
         self.scan()
     }
     pub fn reserve(&self, id: Uuid, owner: &str, size: u64) -> Result<Paths> {
+        if self.objects.remote() {
+            return Err(Failure(503, "Use asynchronous object quota reservation"));
+        }
+        self.reserve_inner(id, owner, size, None)
+    }
+    fn reserve_inner(
+        &self,
+        id: Uuid,
+        owner: &str,
+        size: u64,
+        remote: Option<u64>,
+    ) -> Result<Paths> {
         if !(1..=MAX_FILE).contains(&size) {
             return Err(Failure(413, "File is too large or has an invalid size"));
         }
@@ -283,7 +299,13 @@ impl Storage {
             }
         } else {
             self.cleanup();
-            let usage = self.scan()?;
+            let mut usage = self.scan()?;
+            if let Some(used) = remote {
+                usage.used_bytes = used;
+                usage.remaining_bytes = self
+                    .quota
+                    .saturating_sub(used.saturating_add(usage.reserved_bytes));
+            }
             let existing = self.size(&paths.partial)?.unwrap_or(0);
             if size.saturating_sub(existing) > usage.remaining_bytes {
                 return Err(Failure(507, "Materials storage is full"));
@@ -325,6 +347,9 @@ impl Storage {
     }
     pub fn acknowledge(&self, id: Uuid) -> Result<()> {
         let _serial = self.serial.lock().map_err(|_| unavailable())?;
+        if self.objects.remote() {
+            remove(&self.paths(id).partial)?;
+        }
         remove(&self.paths(id).reservation)
     }
     pub fn delete(&self, id: Uuid) -> Result<()> {
@@ -351,5 +376,138 @@ impl Storage {
         let mut file = tempfile::tempfile_in(&self.root).map_err(|_| unavailable())?;
         file.write_all(b"cbgpu-ready").map_err(|_| unavailable())?;
         file.flush().map_err(|_| unavailable())
+    }
+    pub fn with_objects(mut self, objects: crate::objects::Objects) -> Self {
+        self.objects = objects;
+        self
+    }
+    pub fn remote(&self) -> bool {
+        self.objects.remote()
+    }
+    pub async fn completed_size(&self, id: Uuid) -> Result<Option<u64>> {
+        if self.remote() {
+            self.objects.size(id).await
+        } else {
+            self.size(&self.paths(id).complete)
+        }
+    }
+    pub async fn reserve_async(&self, id: Uuid, owner: &str, size: u64) -> Result<Paths> {
+        if !self.remote() {
+            return self.reserve(id, owner, size);
+        }
+        let _gate = self.reservation_gate.lock().await;
+        let used = self.objects.usage().await?.bytes;
+        self.reserve_inner(id, owner, size, Some(used))
+    }
+    pub async fn promote_async(&self, id: Uuid, size: u64) -> Result<()> {
+        if !self.remote() {
+            return self.promote(id, size);
+        }
+        // Serialize completion with quota snapshots: otherwise an acknowledgement
+        // could remove a reservation after list() but before the local scan.
+        let _quota = self.reservation_gate.lock().await;
+        if self.completed_size(id).await? == Some(size) {
+            return Ok(());
+        }
+        if self.size(&self.paths(id).partial)? != Some(size) {
+            return Err(Failure(409, "Upload is incomplete"));
+        }
+        self.objects
+            .put_file(id, &self.paths(id).partial, size)
+            .await
+    }
+    pub async fn usage_async(&self, clean: bool) -> Result<Usage> {
+        let storage = self.clone();
+        let mut usage = tokio::task::spawn_blocking(move || storage.usage(clean))
+            .await
+            .map_err(|_| unavailable())??;
+        if self.remote() {
+            let remote = self.objects.usage().await?;
+            usage.used_bytes = remote.bytes;
+            usage.file_count = remote.count;
+            usage.remaining_bytes = self
+                .quota
+                .saturating_sub(usage.used_bytes.saturating_add(usage.reserved_bytes));
+        }
+        Ok(usage)
+    }
+    pub async fn object_response(
+        &self,
+        id: Uuid,
+        size: u64,
+        headers: &axum::http::HeaderMap,
+        head: bool,
+    ) -> Result<axum::response::Response> {
+        self.objects.response(id, size, headers, head).await
+    }
+    pub async fn object_probe(&self) -> Result<()> {
+        if self.remote() {
+            self.objects.probe().await?;
+        }
+        Ok(())
+    }
+    pub async fn delete_async(&self, id: Uuid) -> Result<()> {
+        if !self.remote() {
+            return self.delete(id);
+        }
+        let folder = self.root.join(".object-deletions");
+        fs::create_dir_all(&folder).map_err(|_| unavailable())?;
+        if !fs::symlink_metadata(&folder)
+            .map_err(|_| unavailable())?
+            .is_dir()
+        {
+            return Err(unavailable());
+        }
+        let ticket = folder.join(format!("{}.json", id.simple()));
+        let mut temporary = tempfile::NamedTempFile::new_in(&folder).map_err(|_| unavailable())?;
+        serde_json::to_writer(&mut temporary, &serde_json::json!({"id":id}))
+            .map_err(|_| unavailable())?;
+        temporary.as_file().sync_all().map_err(|_| unavailable())?;
+        temporary.persist(&ticket).map_err(|_| unavailable())?;
+        self.objects.delete(id).await?;
+        self.delete(id)?;
+        remove(&ticket)
+    }
+    pub async fn cleanup_object_deletions(&self) -> Result<()> {
+        if !self.remote() {
+            return Ok(());
+        }
+        let folder = self.root.join(".object-deletions");
+        if !folder.exists() {
+            return Ok(());
+        }
+        if !fs::symlink_metadata(&folder)
+            .map_err(|_| unavailable())?
+            .is_dir()
+        {
+            return Err(unavailable());
+        }
+        for entry in fs::read_dir(folder).map_err(|_| unavailable())?.take(64) {
+            let entry = entry.map_err(|_| unavailable())?;
+            if !entry.file_type().map_err(|_| unavailable())?.is_file() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Some(stem) = name.strip_suffix(".json") else {
+                continue;
+            };
+            let Ok(id) = Uuid::parse_str(stem) else {
+                continue;
+            };
+            let value: serde_json::Value = serde_json::from_reader(
+                File::open(entry.path())
+                    .map_err(|_| unavailable())?
+                    .take(1024),
+            )
+            .map_err(|_| unavailable())?;
+            if value["id"] != id.to_string() {
+                return Err(unavailable());
+            }
+            let _guard = self.lock(id).lock_owned().await;
+            self.objects.delete(id).await?;
+            self.delete(id)?;
+            remove(&entry.path())?;
+        }
+        Ok(())
     }
 }

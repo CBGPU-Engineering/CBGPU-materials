@@ -33,6 +33,9 @@ async fn metadata(State(state): State<Metadata>, request: Request) -> axum::resp
     if request.uri().path() == "/rest/v1/profiles" {
         return Json(json!([{"is_admin":false}])).into_response();
     }
+    if state.row.lock().unwrap()["fixture_revoked"] == true {
+        return Json(json!([])).into_response();
+    }
     if request.method() == "PATCH" {
         if *state.fail_ack.lock().unwrap() {
             return (axum::http::StatusCode::SERVICE_UNAVAILABLE, Json(json!({}))).into_response();
@@ -59,8 +62,17 @@ impl Drop for Fixture {
 }
 impl Fixture {
     async fn new(writes: bool) -> Self {
+        Self::with_objects(writes, None).await
+    }
+    async fn with_objects(
+        writes: bool,
+        objects: Option<cbgpu_materials::objects::Objects>,
+    ) -> Self {
         let directory = tempfile::tempdir().unwrap();
-        let storage = Storage::open(directory.path().into(), 100).unwrap();
+        let mut storage = Storage::open(directory.path().into(), 100).unwrap();
+        if let Some(objects) = objects {
+            storage = storage.with_objects(objects);
+        }
         let id = Uuid::new_v4();
         let state = Metadata {
             row: Arc::new(Mutex::new(
@@ -322,4 +334,169 @@ fn cleanup_skips_active_uploads_and_never_deletes_completed_files() {
         .unwrap();
     assert_eq!(storage.usage(true).unwrap().used_bytes, 6);
     assert_eq!(std::fs::read(paths.complete).unwrap(), b"abcdef");
+}
+
+/// An explicitly supplied disposable MinIO endpoint only. Never uses AWS_* or operating credentials.
+#[tokio::test]
+#[ignore = "requires isolated MinIO with synthetic fixture credentials"]
+async fn private_s3_multipart_ranges_quota_ack_recovery_and_rls() {
+    use cbgpu_materials::objects::{Objects, S3Config};
+    use object_store::{
+        aws::{AwsAuthorizer, AwsCredential},
+        client::{HttpRequest, HttpRequestBody},
+    };
+    let endpoint =
+        std::env::var("CBGPU_MATERIALS_TEST_S3_ENDPOINT").expect("loopback MinIO endpoint");
+    let url = reqwest::Url::parse(&endpoint).unwrap();
+    assert_eq!(url.scheme(), "http");
+    assert_eq!(url.host_str(), Some("127.0.0.1"));
+    let bucket = format!("cbgpu-fixture-{}", Uuid::new_v4().simple());
+    let credential = AwsCredential {
+        key_id: "materials-fixture".into(),
+        secret_key: "materials-fixture-private-only".into(),
+        token: None,
+    };
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let mut request: HttpRequest = axum::http::Request::builder()
+        .method("PUT")
+        .uri(format!("{endpoint}/{bucket}"))
+        .body(HttpRequestBody::empty())
+        .unwrap();
+    AwsAuthorizer::new(&credential, "s3", "us-east-1")
+        .try_authorize(&mut request, None)
+        .unwrap();
+    let created = client
+        .put(request.uri().to_string())
+        .headers(request.headers().clone())
+        .body("")
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        created.status().is_success(),
+        "bucket creation status {}",
+        created.status()
+    );
+    let objects = Objects::s3(S3Config {
+        bucket: bucket.clone(),
+        region: "us-east-1".into(),
+        prefix: "private-fixture".into(),
+        endpoint: Some(endpoint.clone()),
+        allow_http: true,
+        access_key: Some(credential.key_id),
+        secret_key: Some(credential.secret_key),
+        token: None,
+    })
+    .unwrap();
+    // Exercise real multipart, not just a small single PUT.
+    let source = tempfile::NamedTempFile::new().unwrap();
+    let data = vec![91u8; 9 * 1024 * 1024];
+    std::fs::write(source.path(), &data).unwrap();
+    let id = Uuid::new_v4();
+    objects
+        .put_file(id, source.path(), data.len() as u64)
+        .await
+        .unwrap();
+    assert_eq!(objects.size(id).await.unwrap(), Some(data.len() as u64));
+    let head = objects
+        .response(id, data.len() as u64, &axum::http::HeaderMap::new(), true)
+        .await
+        .unwrap();
+    assert_eq!(head.status(), 200);
+    assert_eq!(head.headers()["content-length"], data.len().to_string());
+    let etag = head.headers()["etag"].clone();
+    let mut conditional = axum::http::HeaderMap::new();
+    conditional.insert("if-none-match", etag);
+    assert_eq!(
+        objects
+            .response(id, data.len() as u64, &conditional, false)
+            .await
+            .unwrap()
+            .status(),
+        304
+    );
+    let unsigned = client
+        .get(format!("{endpoint}/{bucket}/{}", objects.key(id)))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unsigned.status(), 403);
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert("range", "bytes=100-109".parse().unwrap());
+    let response = objects
+        .response(id, data.len() as u64, &headers, false)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 206);
+    assert_eq!(
+        response.into_body().collect().await.unwrap().to_bytes(),
+        &data[100..110]
+    );
+    use sha2::{Digest, Sha256};
+    assert_eq!(
+        objects.sha256(id).await.unwrap(),
+        format!("{:x}", Sha256::digest(&data))
+    );
+    objects.delete(id).await.unwrap();
+    assert_eq!(objects.size(id).await.unwrap(), None);
+    let f = Fixture::with_objects(true, Some(objects.clone())).await;
+    *f.metadata.fail_ack.lock().unwrap() = true;
+    assert_eq!(f.call("PUT", "/content", "owner", "abcdef").await.0, 503);
+    assert_eq!(objects.size(f.id).await.unwrap(), Some(6));
+    *f.metadata.fail_ack.lock().unwrap() = false;
+    assert_eq!(f.call("GET", "/upload", "owner", "").await.0, 200);
+    assert_eq!(
+        f.call("GET", "/content", "owner", "").await,
+        (200, b"abcdef".to_vec())
+    );
+    assert_eq!(f.call("GET", "/content", "other", "").await.0, 404);
+    assert_eq!(f.call("GET", "/content", "invalid", "").await.0, 401);
+    assert_eq!(f.call("DELETE", "", "other", "").await.0, 404);
+    f.metadata.row.lock().unwrap()["fixture_revoked"] = json!(true);
+    assert_eq!(f.call("GET", "/content", "owner", "").await.0, 404);
+    f.metadata.row.lock().unwrap()["fixture_revoked"] = json!(false);
+    let second = Uuid::new_v4();
+    assert_eq!(
+        f.storage
+            .reserve_async(second, "owner", 95)
+            .await
+            .unwrap_err()
+            .0,
+        507
+    );
+    assert_eq!(f.storage.usage_async(false).await.unwrap().used_bytes, 6);
+    // A provider denial leaves a durable deletion ticket; a later authorized
+    // maintenance pass finishes physical cleanup without metadata access bypass.
+    let denied = Objects::s3(S3Config {
+        bucket: bucket.clone(),
+        region: "us-east-1".into(),
+        prefix: "private-fixture".into(),
+        endpoint: Some(endpoint),
+        allow_http: true,
+        access_key: Some("materials-fixture".into()),
+        secret_key: Some("wrong-fixture-password".into()),
+        token: None,
+    })
+    .unwrap();
+    assert_eq!(
+        f.storage
+            .clone()
+            .with_objects(denied)
+            .delete_async(f.id)
+            .await
+            .unwrap_err()
+            .0,
+        503
+    );
+    assert!(
+        f.storage
+            .root
+            .join(".object-deletions")
+            .join(format!("{}.json", f.id.simple()))
+            .exists()
+    );
+    f.storage.cleanup_object_deletions().await.unwrap();
+    assert_eq!(objects.size(f.id).await.unwrap(), None);
+    assert_eq!(f.call("DELETE", "", "owner", "").await.0, 200);
+    assert_eq!(objects.size(f.id).await.unwrap(), None);
 }
