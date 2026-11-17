@@ -623,3 +623,17 @@ async fn scoped_authority_precedes_body_and_rechecks_before_finish() {
     assert_eq!(f.app.clone().oneshot(req).await.unwrap().status(), 403);
     assert_eq!(f.metadata.row.lock().unwrap()["status"], "pending");
 }
+
+#[tokio::test]
+async fn scoped_owned_completed_download_survives_grant_loss_but_not_logout() {
+    let f = Fixture::with_mode(true, None, true).await;
+    assert_eq!(f.call("PUT", "/content", "owner", "abcdef").await.0, 200);
+    f.metadata.row.lock().unwrap()["fixture_grant"] = json!(false);
+    assert_eq!(
+        f.call("GET", "/content", "owner", "").await,
+        (200, b"abcdef".to_vec())
+    );
+    assert_eq!(f.call("GET", "/content", "other", "").await.0, 404);
+    f.metadata.row.lock().unwrap()["fixture_session_revoked"] = json!(true);
+    assert_eq!(f.call("GET", "/content", "owner", "").await.0, 401);
+}
