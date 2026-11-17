@@ -38,6 +38,7 @@ pub struct App {
     pub backend: String,
     pub anon: String,
     pub writes: bool,
+    pub scoped: bool,
     client: reqwest::Client,
 }
 impl App {
@@ -70,8 +71,42 @@ impl App {
             backend: backend.trim_end_matches('/').to_owned(),
             anon,
             writes,
+            scoped: false,
             client,
         })
+    }
+    pub fn with_scoped_mode(mut self, scoped: bool) -> Self {
+        self.scoped = scoped;
+        self
+    }
+    async fn resource(&self, token: &str, school: &str) -> Result<()> {
+        if school.is_empty()
+            || school.len() > 100
+            || !school
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+        {
+            return Err(Failure(400, "Select a valid school resource context"));
+        }
+        let (status, value) = self
+            .json(
+                reqwest::Method::POST,
+                "/rest/v1/rpc/cbgpu_self_resource_access",
+                token,
+                &[],
+                Some(json!({"target_school":school})),
+            )
+            .await?;
+        if status != 200 {
+            return Err(Failure(503, "School resource authority is unavailable"));
+        }
+        if value["school_id"] != school || value["resources"]["school_storage"] != true {
+            return Err(Failure(
+                403,
+                "School storage access is unavailable or expired",
+            ));
+        }
+        Ok(())
     }
     async fn json(
         &self,
@@ -87,7 +122,10 @@ impl App {
             .header("apikey", &self.anon)
             .bearer_auth(token)
             .query(query);
-        if method == reqwest::Method::PATCH || method == reqwest::Method::DELETE {
+        if method == reqwest::Method::PATCH
+            || method == reqwest::Method::DELETE
+            || method == reqwest::Method::POST
+        {
             builder = builder.header("Prefer", "return=representation");
         }
         if let Some(body) = body {
@@ -118,6 +156,20 @@ impl App {
             .await?;
         if status != 200 {
             return Err(Failure(401, "Invalid session"));
+        }
+        if self.scoped {
+            let (status, fresh) = self
+                .json(
+                    reqwest::Method::POST,
+                    "/rest/v1/rpc/cbgpu_self_session_status",
+                    token,
+                    &[],
+                    Some(json!({})),
+                )
+                .await?;
+            if status != 200 || fresh["valid"] != true {
+                return Err(Failure(401, "Session is no longer active"));
+            }
         }
         value["id"]
             .as_str()
@@ -182,6 +234,17 @@ impl App {
         Ok(())
     }
     async fn finish(&self, token: &str, id: Uuid, owner: &str, size: u64) -> Result<()> {
+        if self.scoped {
+            let row = self.material(token, id).await?;
+            self.resource(
+                token,
+                row["school_id"]
+                    .as_str()
+                    .ok_or(Failure(403, "Scoped upload metadata is required"))?,
+            )
+            .await?;
+        }
+
         self.storage.promote_async(id, size).await?;
         let (status, value) = self
             .json(
@@ -334,6 +397,113 @@ async fn handle(State(app): State<Arc<App>>, request: Request) -> Result<Respons
             json!({"used_bytes":usage.used_bytes,"quota_bytes":usage.quota_bytes,"remaining_bytes":usage.remaining_bytes})
         }));
     }
+    if path == "/materials" && method == "POST" {
+        if !app.scoped {
+            return Err(Failure(404, "Not Found"));
+        }
+        app.writing()?;
+        let owner = app.user(&token).await?;
+        let school = request
+            .headers()
+            .get("x-cbgpu-school-id")
+            .and_then(|v| v.to_str().ok())
+            .ok_or(Failure(400, "Select a school resource context"))?
+            .to_owned();
+        app.resource(&token, &school).await?;
+        let bytes = axum::body::to_bytes(request.into_body(), 16384)
+            .await
+            .map_err(|_| Failure(413, "Upload metadata is too large"))?;
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Create {
+            upload_id: Uuid,
+            title: String,
+            file_name: String,
+            content_type: String,
+            size_bytes: u64,
+            #[serde(default)]
+            tags: Vec<String>,
+        }
+        let data: Create =
+            serde_json::from_slice(&bytes).map_err(|_| Failure(400, "Invalid upload metadata"))?;
+        if data.title.trim().is_empty()
+            || data.title.chars().count() > 120
+            || data.file_name.is_empty()
+            || data.file_name.chars().count() > 255
+            || data.content_type.len() > 255
+            || data.size_bytes == 0
+            || data.size_bytes > MAX_FILE
+            || data.tags.len() > 8
+            || data.tags.iter().any(|v| v.chars().count() > 20)
+        {
+            return Err(Failure(400, "Invalid upload metadata"));
+        }
+        let (lookup_status, existing) = app
+            .json(
+                reqwest::Method::GET,
+                "/rest/v1/shared_materials",
+                &token,
+                &[
+                    ("id", format!("eq.{}", data.upload_id)),
+                    ("select", "*".into()),
+                    ("limit", "1".into()),
+                ],
+                None,
+            )
+            .await?;
+        if lookup_status != 200 {
+            return Err(Failure(503, "Upload metadata is unavailable"));
+        }
+        if let Some(row) = existing.as_array().and_then(|v| v.first()) {
+            if row["uploader_id"] != owner
+                || row["school_id"] != school
+                || row["access_scope"] != "SCHOOL"
+                || row["size_bytes"] != data.size_bytes
+                || row["file_name"] != data.file_name
+                || row["title"] != data.title.trim()
+                || row["tags"] != json!(data.tags)
+            {
+                return Err(Failure(409, "Upload identifier is already in use"));
+            }
+            return Ok(output(
+                json!({"id":row["id"],"school_id":row["school_id"],"access_scope":row["access_scope"],"status":row["status"],"size_bytes":row["size_bytes"]}),
+            ));
+        }
+        let body = json!({"id":data.upload_id,"uploader_id":owner,"title":data.title.trim(),"file_name":data.file_name,"content_type":data.content_type,"size_bytes":data.size_bytes,"tags":data.tags,"status":"pending","school_id":school,"access_scope":"SCHOOL","allowed_school_ids":[]});
+        let (status, result) = app
+            .json(
+                reqwest::Method::POST,
+                "/rest/v1/shared_materials",
+                &token,
+                &[(
+                    "select",
+                    "id,school_id,access_scope,status,size_bytes".into(),
+                )],
+                Some(body),
+            )
+            .await?;
+        if status != 201 {
+            return Err(Failure(
+                if status == 403 { 403 } else { 503 },
+                "Could not create scoped upload",
+            ));
+        }
+        let row = result
+            .as_array()
+            .and_then(|v| v.first())
+            .ok_or(Failure(503, "Invalid upload metadata response"))?;
+        if row["school_id"] != school
+            || row["access_scope"] != "SCHOOL"
+            || row["status"] != "pending"
+            || row["id"]
+                .as_str()
+                .and_then(|v| Uuid::parse_str(v).ok())
+                .is_none()
+        {
+            return Err(Failure(503, "Invalid upload metadata response"));
+        }
+        return Ok((StatusCode::CREATED, axum::Json(row.clone())).into_response());
+    }
     let parts = path.trim_matches('/').split('/').collect::<Vec<_>>();
     if parts.len() < 2 || parts[0] != "materials" {
         return Err(Failure(404, "Not Found"));
@@ -398,6 +568,22 @@ async fn handle(State(app): State<Arc<App>>, request: Request) -> Result<Respons
     }
     if parts.len() != 3 {
         return Err(Failure(404, "Not Found"));
+    }
+    if app.scoped
+        && material["status"] == "pending"
+        && (method == "PUT" || (parts[2] == "upload" && method == "GET"))
+    {
+        let school = material["school_id"]
+            .as_str()
+            .ok_or(Failure(403, "Scoped upload metadata is required"))?;
+        if material["access_scope"] != "SCHOOL"
+            || material["allowed_school_ids"]
+                .as_array()
+                .is_none_or(|v| !v.is_empty())
+        {
+            return Err(Failure(403, "Scoped upload metadata is required"));
+        }
+        app.resource(&token, school).await?;
     }
     if parts[2] == "upload" && method == "GET" {
         if material["status"] == "ready" {

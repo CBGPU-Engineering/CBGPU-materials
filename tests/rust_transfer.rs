@@ -30,6 +30,38 @@ async fn metadata(State(state): State<Metadata>, request: Request) -> axum::resp
             (axum::http::StatusCode::UNAUTHORIZED, Json(json!({}))).into_response()
         };
     }
+    if request.uri().path() == "/rest/v1/rpc/cbgpu_self_session_status" {
+        return Json(json!({"valid":state.row.lock().unwrap()["fixture_session_revoked"]!=true}))
+            .into_response();
+    }
+    if request.uri().path() == "/rest/v1/rpc/cbgpu_self_resource_access" {
+        let bytes = axum::body::to_bytes(request.into_body(), 16384)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        let allowed = state.row.lock().unwrap()["fixture_grant"] != false
+            && body["target_school"] == "fixture-b";
+        return Json(
+            json!({"school_id":body["target_school"],"resources":{"school_storage":allowed}}),
+        )
+        .into_response();
+    }
+    if request.uri().path() == "/rest/v1/shared_materials" && request.method() == "POST" {
+        let bytes = axum::body::to_bytes(request.into_body(), 16384)
+            .await
+            .unwrap();
+        let row: Value = serde_json::from_slice(&bytes).unwrap();
+        *state.row.lock().unwrap() = row.clone();
+        return (axum::http::StatusCode::CREATED, Json(json!([row]))).into_response();
+    }
+    if request.uri().path() == "/rest/v1/shared_materials" && request.method() == "GET" {
+        let url = reqwest::Url::parse(&format!("http://fixture{}", request.uri())).unwrap();
+        if let Some((_, id)) = url.query_pairs().find(|(k, _)| k == "id")
+            && id != format!("eq.{}", state.row.lock().unwrap()["id"].as_str().unwrap())
+        {
+            return Json(json!([])).into_response();
+        }
+    }
     if request.uri().path() == "/rest/v1/profiles" {
         return Json(json!([{"is_admin":false}])).into_response();
     }
@@ -68,6 +100,13 @@ impl Fixture {
         writes: bool,
         objects: Option<cbgpu_materials::objects::Objects>,
     ) -> Self {
+        Self::with_mode(writes, objects, false).await
+    }
+    async fn with_mode(
+        writes: bool,
+        objects: Option<cbgpu_materials::objects::Objects>,
+        scoped: bool,
+    ) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let mut storage = Storage::open(directory.path().into(), 100).unwrap();
         if let Some(objects) = objects {
@@ -76,7 +115,7 @@ impl Fixture {
         let id = Uuid::new_v4();
         let state = Metadata {
             row: Arc::new(Mutex::new(
-                json!({"id":id,"uploader_id":"owner","status":"pending","size_bytes":6,"file_name":"연구.txt"}),
+                json!({"id":id,"uploader_id":"owner","status":"pending","size_bytes":6,"file_name":"연구.txt","school_id":"fixture-b","access_scope":"SCHOOL","allowed_school_ids":[]}),
             )),
             fail_ack: Arc::new(Mutex::new(false)),
         };
@@ -91,7 +130,8 @@ impl Fixture {
                 "public-anon".into(),
                 writes,
             )
-            .unwrap(),
+            .unwrap()
+            .with_scoped_mode(scoped),
         );
         Self {
             _directory: directory,
@@ -499,4 +539,87 @@ async fn private_s3_multipart_ranges_quota_ack_recovery_and_rls() {
     assert_eq!(objects.size(f.id).await.unwrap(), None);
     assert_eq!(f.call("DELETE", "", "owner", "").await.0, 200);
     assert_eq!(objects.size(f.id).await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn scoped_upload_revocation_preserves_private_bytes_and_owner_delete() {
+    let f = Fixture::with_mode(true, None, true).await;
+    assert_eq!(f.call("PUT", "/chunks", "owner", "abc").await.0, 200);
+    f.metadata.row.lock().unwrap()["fixture_grant"] = json!(false);
+    assert_eq!(
+        f.call("PUT", "/chunks?offset=3", "owner", "def").await.0,
+        403
+    );
+    assert_eq!(f.call("GET", "/upload", "owner", "").await.0, 403);
+    assert_eq!(
+        f.storage.size(&f.storage.paths(f.id).partial).unwrap(),
+        Some(3)
+    );
+    assert_eq!(f.metadata.row.lock().unwrap()["status"], "pending");
+    f.metadata.row.lock().unwrap()["fixture_session_revoked"] = json!(true);
+    assert_eq!(f.call("DELETE", "", "owner", "").await.0, 401);
+    f.metadata.row.lock().unwrap()["fixture_session_revoked"] = json!(false);
+    assert_eq!(f.call("DELETE", "", "owner", "").await.0, 200);
+}
+#[tokio::test]
+async fn scoped_metadata_rejects_other_school_and_owner_fields_and_retries_idempotently() {
+    let f = Fixture::with_mode(true, None, true).await;
+    let upload = Uuid::new_v4();
+    let body = json!({"upload_id":upload,"title":"Test","tags":[],"file_name":"fixture.txt","content_type":"text/plain","size_bytes":6});
+    for (school, extra, expected) in [
+        ("fixture-a", false, 403),
+        ("fixture-b", true, 400),
+        ("fixture-b", false, 201),
+        ("fixture-b", false, 200),
+    ] {
+        let mut payload = body.clone();
+        if extra {
+            payload["uploader_id"] = json!("other");
+        }
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/materials")
+            .header("authorization", "Bearer owner")
+            .header("x-cbgpu-school-id", school)
+            .body(axum::body::Body::from(payload.to_string()))
+            .unwrap();
+        let response = f.app.clone().oneshot(req).await.unwrap();
+        assert_eq!(response.status().as_u16(), expected);
+    }
+    assert_eq!(f.metadata.row.lock().unwrap()["uploader_id"], "owner");
+    assert_eq!(f.metadata.row.lock().unwrap()["school_id"], "fixture-b");
+    assert_eq!(f.metadata.row.lock().unwrap()["access_scope"], "SCHOOL");
+}
+
+#[tokio::test]
+async fn scoped_authority_precedes_body_and_rechecks_before_finish() {
+    let f = Fixture::with_mode(true, None, true).await;
+    f.metadata.row.lock().unwrap()["fixture_grant"] = json!(false);
+    let stream = futures_util::stream::once(async {
+        panic!("unauthorized body must not be polled");
+        #[allow(unreachable_code)]
+        Ok::<_, std::io::Error>(axum::body::Bytes::new())
+    });
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri("/materials")
+        .header("authorization", "Bearer owner")
+        .header("x-cbgpu-school-id", "fixture-b")
+        .body(axum::body::Body::from_stream(stream))
+        .unwrap();
+    assert_eq!(f.app.clone().oneshot(req).await.unwrap().status(), 403);
+    f.metadata.row.lock().unwrap()["fixture_grant"] = json!(true);
+    let state = f.metadata.clone();
+    let stream = futures_util::stream::once(async move {
+        state.row.lock().unwrap()["fixture_grant"] = json!(false);
+        Ok::<_, std::io::Error>(axum::body::Bytes::from_static(b"abcdef"))
+    });
+    let req = axum::http::Request::builder()
+        .method("PUT")
+        .uri(format!("/materials/{}/content", f.id))
+        .header("authorization", "Bearer owner")
+        .body(axum::body::Body::from_stream(stream))
+        .unwrap();
+    assert_eq!(f.app.clone().oneshot(req).await.unwrap().status(), 403);
+    assert_eq!(f.metadata.row.lock().unwrap()["status"], "pending");
 }

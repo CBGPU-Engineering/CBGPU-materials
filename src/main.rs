@@ -2,6 +2,24 @@ use axum::http::{HeaderValue, Method, header};
 use cbgpu_materials::{App, storage::Storage};
 use std::{env, net::SocketAddr, path::PathBuf, time::Duration};
 use tower_http::cors::CorsLayer;
+fn scope_flag(value: &str) -> std::result::Result<bool, &'static str> {
+    match value {
+        "1" | "true" => Ok(true),
+        "0" | "false" => Ok(false),
+        _ => Err("Invalid server authorization flag"),
+    }
+}
+fn scoped_mode() -> std::result::Result<bool, &'static str> {
+    let mut enabled = false;
+    for key in ["CBGPU_MULTISCHOOL_V1", "CBGPU_ACCOUNT_V2"] {
+        match env::var(key) {
+            Err(env::VarError::NotPresent) => {}
+            Ok(v) => enabled |= scope_flag(&v)?,
+            _ => return Err("Invalid server authorization flag"),
+        }
+    }
+    Ok(enabled)
+}
 async fn run() -> std::result::Result<(), &'static str> {
     if env::args().nth(1).as_deref() == Some("healthcheck") {
         let port = env::var("CBGPU_MATERIALS_LISTEN")
@@ -69,7 +87,8 @@ async fn run() -> std::result::Result<(), &'static str> {
         env::var("CBGPU_SUPABASE_ANON_KEY").map_err(|_| "Metadata public key is required")?,
         writes,
     )
-    .map_err(|_| "Metadata configuration is invalid")?;
+    .map_err(|_| "Metadata configuration is invalid")?
+    .with_scoped_mode(scoped_mode()?);
     let origins = env::var("CBGPU_MATERIALS_ORIGINS")
         .unwrap_or_else(|_| {
             "https://cbgpu.com,https://admin.cbgpu.com,http://localhost:3000".into()
@@ -81,13 +100,14 @@ async fn run() -> std::result::Result<(), &'static str> {
         .map_err(|_| "Invalid CORS origin")?;
     let cors = CorsLayer::new()
         .allow_origin(origins)
-        .allow_methods([Method::GET, Method::PUT, Method::DELETE])
+        .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
         .allow_headers([
             header::AUTHORIZATION,
             header::CONTENT_TYPE,
             header::ACCEPT,
             header::ACCEPT_LANGUAGE,
             header::CONTENT_LANGUAGE,
+            header::HeaderName::from_static("x-cbgpu-school-id"),
         ]);
     let listen: SocketAddr = env::var("CBGPU_MATERIALS_LISTEN")
         .unwrap_or_else(|_| "127.0.0.1:8423".into())
@@ -143,5 +163,21 @@ async fn main() {
     if let Err(message) = run().await {
         eprintln!("{message}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn scoped_flags_have_no_truthy_or_malformed_legacy_fallback() {
+        for value in ["1", "true"] {
+            assert!(super::scope_flag(value).unwrap());
+        }
+        for value in ["0", "false"] {
+            assert!(!super::scope_flag(value).unwrap());
+        }
+        for value in ["", "yes", "TRUE", " 1", "1 ", "tru"] {
+            assert!(super::scope_flag(value).is_err());
+        }
     }
 }

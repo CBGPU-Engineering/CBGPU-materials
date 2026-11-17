@@ -240,3 +240,31 @@ The isolated MinIO test executes the actual CLI across a full synthetic inventor
 checks exact byte hashes, and proves corrupted sources, differing destinations
 and existing reverse roots are refused. No operating inventory, AWS bucket,
 credentials, metadata migration or RDS connection is used by these tests.
+
+### Scoped school and temporary-guest uploads (source candidate)
+
+Server `CBGPU_MULTISCHOOL_V1=1|true` or `CBGPU_ACCOUNT_V2=1|true`
+enables fresh caller-session and school-resource checks. Only canonical
+`0|false|1|true` values are accepted; browser public flags never enable server
+authority. Both server flags default off for the legacy API.
+
+In scoped mode, `POST /materials` requires caller Bearer authentication and an
+`X-CBGPU-School-Id` candidate. Before reading the body, the server verifies the
+fresh session and `cbgpu_self_resource_access(target_school)` storage permission.
+The bounded JSON contains `upload_id` (client-generated UUID for retry), `title`,
+`file_name`, `content_type`, `size_bytes`, and `tags`. Identity and visibility
+fields are rejected. The caller-JWT metadata insert fixes uploader, selected
+school, pending status, `SCHOOL` visibility and an empty allowed-school list.
+Identical same-owner retries reuse their existing metadata; conflicting UUIDs
+fail closed. No service-role credentials are used.
+
+Chunk/resume requests authorize the school stored in the owned metadata, not a
+client override. Completion checks authority again: revoked or expired grants
+cannot publish a ready file, while pending bytes and owned records remain for
+explicit owner recovery/deletion. Owned completed downloads and deletion require
+fresh identity, independently of expired school-resource permission.
+
+This requires the reviewed account/school migrations (including scoped material
+RLS) and a paired web/file-service handoff. Existing operating immutable releases
+and `/api/files` origin are unchanged by source preparation. Tests use disposable
+storage and synthetic metadata, never operating user files.
