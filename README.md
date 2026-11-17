@@ -158,3 +158,85 @@ inside a disposable Go 1.24 container, with a loopback-only listener and a
 128 MiB tmpfs. It also checks conditional GET/HEAD, immediate RLS revocation,
 and durable deletion recovery after a provider authorization failure. This
 external test dependency is not application source or a production requirement.
+
+### Native migration CLI
+
+`cbgpu-materials-migrate` implements the inventory procedure above without
+changing PostgreSQL metadata. It uses the same private S3 environment settings.
+The normal server remains Cargo's default binary. The CLI prefix precedence is
+`--prefix`, then `CBGPU_MATERIALS_S3_PREFIX`, then `materials-private-v1`; it
+never copies into an empty/public root. Reports include the local root and a
+SHA-256 fingerprint of the JSON array `[bucket, region, prefix, endpoint-or-null]`
+(without credentials), alongside the exact inventory hash. Build the separate tool with
+`cargo build --locked --bin cbgpu-materials-migrate`.
+
+First review a read-only-source plan. Reports must be **new files outside the
+storage directory**, and the manifest must use the exact canonical format above:
+
+```bash
+cargo run --locked --bin cbgpu-materials-migrate -- \
+  --direction local-to-s3 --manifest /private/inventory.tsv \
+  --local-root /private/original-materials --report /private/plan.json
+```
+
+The plan verifies source bytes and any existing destination objects. It copies
+one local source at a time to a private temporary snapshot for verification;
+therefore allow free temporary disk space up to the largest file. All transfers
+stream with bounded buffers. The tool rejects symlinked local source components
+on Unix, invalid/duplicate/unsorted UUID entries, noncanonical sizes/hashes and
+unexpected paths. It never follows a filename supplied by a browser.
+
+After independently stopping **all** writers (including remote writers), draining
+uploads, preserving the source backup and reviewing the printed manifest hash:
+
+```bash
+cargo run --locked --bin cbgpu-materials-migrate -- \
+  --direction local-to-s3 --manifest /private/inventory.tsv \
+  --local-root /private/original-materials --report /private/copy.json \
+  --apply --confirm-writers-fenced \
+  --expected-manifest-sha256 REPLACE_WITH_REVIEWED_64_HEX_HASH
+```
+
+Existing same-UUID objects are read back and must match both size and SHA-256;
+they are skipped only after verification. Differing objects cause failure, never
+overwrite. Each newly copied object is also fully read back and verified. No
+original object or file is removed. A failure can leave already verified copies;
+rerun with the same pinned inventory and a **new** report filename. Reports are
+atomically created without replacing existing files and are mode 0600 on Unix.
+They explicitly record `external_writers_inspected: false`: the fence flag is an
+operator acknowledgement, **not** remote writer detection or a distributed lock.
+Do not use the tool while any writer can mutate the source or destination.
+
+For rollback after S3-only writes, independently create a **current** authorized
+inventory, then copy into a **nonexistent** local destination:
+
+```bash
+cargo run --locked --bin cbgpu-materials-migrate -- \
+  --direction s3-to-local --manifest /private/current-inventory.tsv \
+  --local-root /private/new-restored-materials --report /private/reverse.json \
+  --apply --confirm-writers-fenced \
+  --expected-manifest-sha256 REPLACE_WITH_REVIEWED_64_HEX_HASH
+```
+
+Reverse copy creates a private destination receipt bound to the exact inventory
+hash and absolute root. It refuses an existing root by default; only an explicit
+`--resume` accepts that tool-created matching receipt. Completed files are
+published without replacing an existing path and rehashed from local disk.
+Temporary files are removed on reported copy errors; a killed process can leave
+private temporary files for later operator review. Original storage is never reused as the
+reverse destination. Changing the server configuration, restarting workers,
+restoring metadata or opening admissions remains a separate reviewed operation.
+On non-Unix systems, filesystem ACL and reparse-point hardening require separate
+validation before migration; the operating-source handoff was tested on Linux.
+
+```bash
+cargo test --locked --test migration
+CBGPU_MATERIALS_TEST_S3_ENDPOINT=http://127.0.0.1:PORT \
+  cargo test --locked --test migration minio_full -- --ignored
+```
+
+The isolated MinIO test executes the actual CLI across a full synthetic inventory
+(including a 9 MiB multipart object), verifies forward/reverse/resume reports,
+checks exact byte hashes, and proves corrupted sources, differing destinations
+and existing reverse roots are refused. No operating inventory, AWS bucket,
+credentials, metadata migration or RDS connection is used by these tests.

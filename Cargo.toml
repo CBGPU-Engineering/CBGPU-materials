@@ -1,5 +1,6 @@
 [package]
 name = "cbgpu-materials"
+default-run = "cbgpu-materials"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
@@ -20,6 +21,7 @@ tempfile = "3"
 object_store = { version = "=0.14.2", default-features = false, features = ["aws", "fs"] }
 sha2 = "0.10"
 httpdate = "1"
+libc = "0.2"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

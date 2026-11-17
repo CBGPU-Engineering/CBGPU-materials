@@ -1,3 +1,4 @@
+pub mod migration;
 pub mod objects;
 pub mod storage;
 use axum::{

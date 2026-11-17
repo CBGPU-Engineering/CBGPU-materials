@@ -163,6 +163,41 @@ impl Objects {
         }
     }
     /// Full read-back digest for migration verification. ETags and user metadata are not byte proofs.
+    /// Streams a private immutable migration snapshot and verifies actual bytes.
+    pub async fn download_verified(
+        &self,
+        id: Uuid,
+        output: &mut std::fs::File,
+        size: u64,
+        sha256: &str,
+    ) -> Result<()> {
+        use std::io::Write;
+        let object = self
+            .store
+            .get(&self.key(id))
+            .await
+            .map_err(|_| unavailable())?;
+        if object.meta.size != size {
+            return Err(Failure(409, "Source size differs from manifest"));
+        }
+        let mut stream = object.into_stream();
+        let mut digest = Sha256::new();
+        let mut total = 0u64;
+        while let Some(bytes) = stream.try_next().await.map_err(|_| unavailable())? {
+            total = total
+                .checked_add(bytes.len() as u64)
+                .ok_or_else(unavailable)?;
+            if total > size {
+                return Err(Failure(409, "Source size differs from manifest"));
+            }
+            digest.update(&bytes);
+            output.write_all(&bytes).map_err(|_| unavailable())?;
+        }
+        if total != size || format!("{:x}", digest.finalize()) != sha256 {
+            return Err(Failure(409, "Source SHA-256 differs from manifest"));
+        }
+        Ok(())
+    }
     pub async fn sha256(&self, id: Uuid) -> Result<String> {
         let object = self
             .store
