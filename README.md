@@ -245,7 +245,7 @@ credentials, metadata migration or RDS connection is used by these tests.
 
 Server `CBGPU_MULTISCHOOL_V1=1|true` or `CBGPU_ACCOUNT_V2=1|true`
 enables fresh caller-session and school-resource checks. Only canonical
-`0|false|1|true` values are accepted; browser public flags never enable server
+`0|false|1|true` values are accepted; unset/empty preserve legacy mode; browser public flags never enable server
 authority. Both server flags default off for the legacy API.
 
 In scoped mode, `POST /materials` requires caller Bearer authentication and an

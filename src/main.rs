@@ -5,7 +5,7 @@ use tower_http::cors::CorsLayer;
 fn scope_flag(value: &str) -> std::result::Result<bool, &'static str> {
     match value {
         "1" | "true" => Ok(true),
-        "0" | "false" => Ok(false),
+        "" | "0" | "false" => Ok(false),
         _ => Err("Invalid server authorization flag"),
     }
 }
@@ -173,10 +173,10 @@ mod tests {
         for value in ["1", "true"] {
             assert!(super::scope_flag(value).unwrap());
         }
-        for value in ["0", "false"] {
+        for value in ["", "0", "false"] {
             assert!(!super::scope_flag(value).unwrap());
         }
-        for value in ["", "yes", "TRUE", " 1", "1 ", "tru"] {
+        for value in ["yes", "TRUE", " 1", "1 ", "tru"] {
             assert!(super::scope_flag(value).is_err());
         }
     }
