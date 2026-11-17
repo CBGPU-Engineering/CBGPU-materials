@@ -34,6 +34,27 @@ async fn metadata(State(state): State<Metadata>, request: Request) -> axum::resp
         return Json(json!({"valid":state.row.lock().unwrap()["fixture_session_revoked"]!=true}))
             .into_response();
     }
+    if request.uri().path() == "/rest/v1/rpc/cbgpu_public_content" {
+        assert_eq!(token, "Bearer public-anon");
+        let bytes = axum::body::to_bytes(request.into_body(), 16384)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            body,
+            json!({"action":"schools_list","payload":{"limit":1,"offset":0}})
+        );
+        let row = state.row.lock().unwrap();
+        if row["fixture_public_health_failure"] == true {
+            return (axum::http::StatusCode::SERVICE_UNAVAILABLE, Json(json!({}))).into_response();
+        }
+        return Json(if row["fixture_public_health_malformed"] == true {
+            json!({"error":"not a projection"})
+        } else {
+            json!({"items":[],"total":0})
+        })
+        .into_response();
+    }
     if request.uri().path() == "/rest/v1/rpc/cbgpu_self_resource_access" {
         let bytes = axum::body::to_bytes(request.into_body(), 16384)
             .await
@@ -55,6 +76,12 @@ async fn metadata(State(state): State<Metadata>, request: Request) -> axum::resp
         return (axum::http::StatusCode::CREATED, Json(json!([row]))).into_response();
     }
     if request.uri().path() == "/rest/v1/shared_materials" && request.method() == "GET" {
+        if token == "Bearer public-anon"
+            && state.row.lock().unwrap()["fixture_raw_anon_denied"] == true
+        {
+            return (axum::http::StatusCode::FORBIDDEN, Json(json!({}))).into_response();
+        }
+
         let url = reqwest::Url::parse(&format!("http://fixture{}", request.uri())).unwrap();
         if let Some((_, id)) = url.query_pairs().find(|(k, _)| k == "id")
             && id != format!("eq.{}", state.row.lock().unwrap()["id"].as_str().unwrap())
@@ -636,4 +663,55 @@ async fn scoped_owned_completed_download_survives_grant_loss_but_not_logout() {
     assert_eq!(f.call("GET", "/content", "other", "").await.0, 404);
     f.metadata.row.lock().unwrap()["fixture_session_revoked"] = json!(true);
     assert_eq!(f.call("GET", "/content", "owner", "").await.0, 401);
+}
+
+#[tokio::test]
+async fn scoped_health_uses_safe_public_projection_when_raw_anonymous_tables_are_denied() {
+    let fixture = Fixture::with_mode(false, None, true).await;
+    fixture.metadata.row.lock().unwrap()["fixture_raw_anon_denied"] = json!(true);
+    let health = || {
+        axum::http::Request::builder()
+            .uri("/health")
+            .body(axum::body::Body::empty())
+            .unwrap()
+    };
+    assert_eq!(
+        fixture
+            .app
+            .clone()
+            .oneshot(health())
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    fixture.metadata.row.lock().unwrap()["fixture_public_health_failure"] = json!(true);
+    assert_eq!(
+        fixture
+            .app
+            .clone()
+            .oneshot(health())
+            .await
+            .unwrap()
+            .status(),
+        503
+    );
+    fixture.metadata.row.lock().unwrap()["fixture_public_health_failure"] = json!(false);
+    fixture.metadata.row.lock().unwrap()["fixture_public_health_malformed"] = json!(true);
+    assert_eq!(
+        fixture
+            .app
+            .clone()
+            .oneshot(health())
+            .await
+            .unwrap()
+            .status(),
+        503
+    );
+    let legacy = Fixture::new(false).await;
+    legacy.metadata.row.lock().unwrap()["fixture_raw_anon_denied"] = json!(true);
+    assert_eq!(
+        legacy.app.clone().oneshot(health()).await.unwrap().status(),
+        503
+    );
 }

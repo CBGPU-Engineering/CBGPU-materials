@@ -356,16 +356,28 @@ async fn handle(State(app): State<Arc<App>>, request: Request) -> Result<Respons
     if path == "/health" && method == "GET" {
         app.storage.writable_probe()?;
         app.storage.object_probe().await?;
-        let (status, _) = app
-            .json(
+        // Scoped schemas deliberately revoke raw anonymous table reads. Probe
+        // the bounded public projection rather than weakening those grants.
+        let (status, value) = if app.scoped {
+            app.json(
+                reqwest::Method::POST,
+                "/rest/v1/rpc/cbgpu_public_content",
+                &app.anon,
+                &[],
+                Some(json!({"action":"schools_list","payload":{"limit":1,"offset":0}})),
+            )
+            .await?
+        } else {
+            app.json(
                 reqwest::Method::GET,
                 "/rest/v1/shared_materials",
                 &app.anon,
                 &[("select", "id".into()), ("limit", "0".into())],
                 None,
             )
-            .await?;
-        if status != 200 {
+            .await?
+        };
+        if status != 200 || app.scoped && !value["items"].is_array() {
             return Err(Failure(503, "Materials database is unavailable"));
         }
         return Ok(output(json!({"ok":true})));
